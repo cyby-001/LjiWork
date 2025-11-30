@@ -22,7 +22,7 @@
 - 零广告、零联网、零跟踪，数据永远在你手机里
 
 ## 截图
-![Screenshot_20251130_145255_com example myapp](https://github.com/user-attachments/assets/66d91208-e80e-4b98-82c5-4962888f779c)
+<img width="290" height="647" alt="0fe751b5a0a2f3e6f6132164f8ca71e8_750" src="https://github.com/user-attachments/assets/66d91208-e80e-4b98-82c5-4962888f779c" />
 
 <img width="290" height="647" alt="c6edf4da2f7c0c0bfc3592f195b90fb4_750" src="https://github.com/user-attachments/assets/3b646100-a75b-4998-b82f-6c83e464305c" />
 
@@ -30,6 +30,7 @@
 
 <img width="290" height="647" alt="0fe751b5a0a2f3e6f6132164f8ca71e8_750" src="https://github.com/user-attachments/assets/740a4d9f-1e58-47ef-a03a-05182bbc37f2" />
 
-![Screenshot_20251130_153813_com example myapp](https://github.com/user-attachments/assets/ac6df769-7edc-4c53-8fce-2ea1d82f7629)
+<img width="290" height="647" alt="0fe751b5a0a2f3e6f6132164f8ca71e8_750" src="https://github.com/user-attachments/assets/ac6df769-7edc-4c53-8fce-2ea1d82f7629" />
+
 ## 下载
-→ [L记加班 v1.0.0.apk](https://github.com/cyby-001/LjiOvertime/releases/latest)
+→ [L记加班 v1.0.0.apk](https://github.com/cyby-001/LjiWork/releases/download/v1.0.0/app-arm64-v8a-release.apk)
