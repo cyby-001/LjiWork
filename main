@@ -1,0 +1,1462 @@
+import 'package:flutter/material.dart';
+import 'package:table_calendar/table_calendar.dart';
+import 'package:intl/intl.dart';
+import 'package:intl/date_symbol_data_local.dart'; 
+import 'package:shared_preferences/shared_preferences.dart';
+import 'dart:convert';
+import 'package:fl_chart/fl_chart.dart';
+import 'package:lunar/lunar.dart'; // 🔥 引入真实农历库
+import 'package:flutter/cupertino.dart';
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  initializeDateFormatting().then((_) => runApp(const MoneyCalendarApp()));
+}
+
+class MoneyCalendarApp extends StatelessWidget {
+  const MoneyCalendarApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: '加薪日历 Pro',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        primarySwatch: Colors.teal,
+        useMaterial3: true,
+        scaffoldBackgroundColor: const Color(0xFFF2F5F9),
+        cardTheme: const CardThemeData(color: Colors.white, surfaceTintColor: Colors.white),
+        inputDecorationTheme: InputDecorationTheme(
+          filled: true,
+          fillColor: Colors.grey.shade50,
+          border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide(color: Colors.grey.shade300)),
+          enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide(color: Colors.grey.shade300)),
+        ),
+      ),
+      home: const CalendarPage(),
+    );
+  }
+}
+
+// --- 🧱 枚举与基础类 ---
+
+enum WorkMode { standard, hourly }
+enum RecordType { overtime, leave }
+enum LeaveType { compensatory, paid, unpaid, none }
+
+class MoneyItem {
+  String name;
+  double amount;
+  MoneyItem(this.name, this.amount);
+  Map<String, dynamic> toJson() => {'n': name, 'a': amount};
+  factory MoneyItem.fromJson(Map<String, dynamic> json) => 
+      MoneyItem(json['n'], (json['a'] as num).toDouble());
+}
+
+class DailyRecord {
+  final RecordType type;
+  final double hours;
+  final double multiplier;
+  final LeaveType leaveType;
+  final double manualDeduction;
+  final String note;
+
+  DailyRecord({
+    required this.type,
+    required this.hours,
+    this.multiplier = 1.0,
+    this.leaveType = LeaveType.none,
+    this.manualDeduction = 0.0,
+    this.note = '',
+  });
+
+  Map<String, dynamic> toJson() => {
+    't': type.index, 'h': hours, 'm': multiplier, 
+    'lt': leaveType.index, 'md': manualDeduction, 'n': note
+  };
+  
+  factory DailyRecord.fromJson(Map<String, dynamic> json) {
+    return DailyRecord(
+      type: RecordType.values[json['t'] ?? 0],
+      hours: (json['h'] as num).toDouble(),
+      multiplier: (json['m'] as num).toDouble(),
+      leaveType: LeaveType.values[json['lt'] ?? 0],
+      manualDeduction: (json['md'] ?? 0).toDouble(),
+      note: json['n'] ?? '',
+    );
+  }
+}
+
+class SalaryConfig {
+  WorkMode mode;
+  double baseSalary;
+  double workDays;
+  int cycleStartDay;
+  List<MoneyItem> additions;
+  List<MoneyItem> deductions;
+
+  SalaryConfig({
+    this.mode = WorkMode.standard,
+    required this.baseSalary,
+    required this.workDays,
+    required this.cycleStartDay,
+    required this.additions,
+    required this.deductions,
+  });
+
+  factory SalaryConfig.defaultConfig() {
+    return SalaryConfig(
+      mode: WorkMode.standard,
+      baseSalary: 10000,
+      workDays: 21.75,
+      cycleStartDay: 1,
+      additions: [MoneyItem('绩效', 2000), MoneyItem('餐补', 500)],
+      deductions: [MoneyItem('社保', 1000), MoneyItem('公积金', 1000), MoneyItem('个税', 500)],
+    );
+  }
+
+  SalaryConfig copy() {
+    return SalaryConfig(
+      mode: mode,
+      baseSalary: baseSalary,
+      workDays: workDays,
+      cycleStartDay: cycleStartDay,
+      additions: additions.map((e) => MoneyItem(e.name, e.amount)).toList(),
+      deductions: deductions.map((e) => MoneyItem(e.name, e.amount)).toList(),
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'mode': mode.index, 'base': baseSalary, 'days': workDays, 'cycle': cycleStartDay,
+    'adds': additions.map((e) => e.toJson()).toList(),
+    'deds': deductions.map((e) => e.toJson()).toList(),
+  };
+
+  factory SalaryConfig.fromJson(Map<String, dynamic> json) {
+    return SalaryConfig(
+      mode: WorkMode.values[json['mode'] ?? 0],
+      baseSalary: (json['base'] as num).toDouble(),
+      workDays: (json['days'] as num).toDouble(),
+      cycleStartDay: json['cycle'] as int,
+      additions: (json['adds'] as List?)?.map((e) => MoneyItem.fromJson(e)).toList() ?? [],
+      deductions: (json['deds'] as List?)?.map((e) => MoneyItem.fromJson(e)).toList() ?? [],
+    );
+  }
+}
+
+// --- 🏠 主页面 ---
+
+class CalendarPage extends StatefulWidget {
+  const CalendarPage({super.key});
+  @override
+  State<CalendarPage> createState() => _CalendarPageState();
+}
+
+class _CalendarPageState extends State<CalendarPage> {
+  bool _isLoading = true;
+  bool _isSalaryHidden = true;
+  DateTime _focusedDay = DateTime.now();
+  DateTime? _selectedDay;
+  Map<String, DailyRecord> _records = {};
+  SalaryConfig _globalConfig = SalaryConfig.defaultConfig();
+  Map<String, SalaryConfig> _monthlyConfigs = {};
+  Map<String, Map<String, double>> _monthlyStatsCache = {};        // 月收入缓存
+  Map<String, Map<String, double>> _monthlyOvertimeCache = {};     // 月加班时长缓存
+  Map<String, List<FlSpot>> _yearlyIncomeCache = {};                // 年收入折线图缓存
+  Map<String, List<FlSpot>> _yearlyOvertimeCache = {};             // 年加班折线图缓存
+
+  @override
+  void initState() {
+    super.initState();
+    _selectedDay = _focusedDay;
+    _loadData();
+  }
+
+  String _getDateKey(DateTime date) => DateFormat('yyyy-MM-dd').format(date);
+  String _getMonthKey(DateTime date) => DateFormat('yyyy-MM').format(date);
+
+  SalaryConfig _getConfigForMonth(DateTime date) {
+    // 继承逻辑：查找当月 -> 查找前12个月 -> 使用全局
+    String currentKey = _getMonthKey(date);
+    if (_monthlyConfigs.containsKey(currentKey)) {
+      return _monthlyConfigs[currentKey]!;
+    }
+    
+    DateTime checkDate = date;
+    for (int i = 0; i < 12; i++) { 
+       checkDate = DateTime(checkDate.year, checkDate.month - 1, 1);
+       String prevKey = _getMonthKey(checkDate);
+       if (_monthlyConfigs.containsKey(prevKey)) {
+         return _monthlyConfigs[prevKey]!;
+       }
+    }
+
+    return _globalConfig;
+  }
+
+  DateTimeRange _getCurrentPayCycle(DateTime focus) {
+    SalaryConfig cfg = _getConfigForMonth(focus);
+    int startDay = cfg.cycleStartDay;
+    if (startDay == 1) {
+      return DateTimeRange(start: DateTime(focus.year, focus.month, 1), end: DateTime(focus.year, focus.month + 1, 0));
+    } else {
+      DateTime start = DateTime(focus.year, focus.month - 1, startDay);
+      DateTime end = DateTime(focus.year, focus.month, startDay - 1);
+      return DateTimeRange(start: start, end: end);
+    }
+  }
+
+  // --- 🧮 完整计算逻辑 (通用版) ---
+
+  double _getHourlyRate(SalaryConfig cfg) {
+    if (cfg.mode == WorkMode.hourly) return cfg.baseSalary;
+    return cfg.baseSalary / cfg.workDays / 8.0;
+  }
+  
+  // 核心计算方法：计算特定日期所在周期的工资
+  Map<String, double> _calculateStatsForDate(DateTime focusDate) {
+  String monthKey = _getMonthKey(focusDate);
+  
+  if (_monthlyStatsCache.containsKey(monthKey)) {
+    return _monthlyStatsCache[monthKey]!;
+  }
+
+  // ======== 下面是你原来的全部计算逻辑，一字不动 ========
+  SalaryConfig cfg = _getConfigForMonth(focusDate);
+  DateTimeRange range = _getCurrentPayCycle(focusDate);
+  DateTime rangeStart = range.start.subtract(const Duration(seconds: 1));
+  DateTime rangeEnd = range.end.add(const Duration(days: 1));
+  double hourlyRate = _getHourlyRate(cfg);
+  double pool15 = 0, pool20 = 0, pool30 = 0;
+  double compLeaveNeeded = 0; 
+  double directDeduction = 0;
+  double overtimeIncome = 0;
+
+  _records.forEach((key, record) {
+    DateTime date = DateTime.parse(key);
+    if (date.isAfter(rangeStart) && date.isBefore(rangeEnd)) {
+      if (record.type == RecordType.overtime) {
+        if (record.multiplier == 1.5) pool15 += record.hours;
+        else if (record.multiplier == 2.0) pool20 += record.hours;
+        else if (record.multiplier == 3.0) pool30 += record.hours;
+        else if (cfg.mode == WorkMode.hourly) overtimeIncome += record.hours * hourlyRate;
+      } else if (record.type == RecordType.leave) {
+        if (record.leaveType == LeaveType.compensatory) compLeaveNeeded += record.hours;
+        else if (record.leaveType == LeaveType.unpaid) {
+          directDeduction += (record.manualDeduction > 0) ? record.manualDeduction : (record.hours * hourlyRate);
+        }
+      }
+    }
+  });
+
+  if (cfg.mode == WorkMode.standard) {
+    double remainingComp = compLeaveNeeded;
+    if (remainingComp > 0 && pool15 >= remainingComp) { pool15 -= remainingComp; remainingComp = 0; } 
+    else if (remainingComp > 0) { remainingComp -= pool15; pool15 = 0; }
+    if (remainingComp > 0 && pool20 >= remainingComp) { pool20 -= remainingComp; remainingComp = 0; } 
+    else if (remainingComp > 0) { remainingComp -= pool20; pool20 = 0; }
+    if (remainingComp > 0) directDeduction += remainingComp * hourlyRate;
+    overtimeIncome = (pool15 * hourlyRate * 1.5) + (pool20 * hourlyRate * 2.0) + (pool30 * hourlyRate * 3.0);
+  }
+
+  double extraAdditions = cfg.additions.fold(0, (sum, item) => sum + item.amount);
+  double extraDeductions = cfg.deductions.fold(0, (sum, item) => sum + item.amount);
+  double baseIncome = (cfg.mode == WorkMode.standard) ? cfg.baseSalary : 0;
+  double totalIncome = baseIncome + extraAdditions + overtimeIncome - directDeduction - extraDeductions;
+  
+  final result = {
+    'total': totalIncome,
+    'base': baseIncome,
+    'adds': extraAdditions,
+    'overtime': overtimeIncome,
+    'deduct': directDeduction + extraDeductions,
+  };
+  // ======== 缓存结果 ========
+  _monthlyStatsCache[monthKey] = result;
+  if (_monthlyStatsCache.length > 24) {
+    // 只保留最近24个月
+    _monthlyStatsCache.remove(_monthlyStatsCache.keys.first);
+  }
+  return result;
+}
+  // 🆕 统计特定月份的加班时长
+Map<String, double> _calculateOvertimeHours(DateTime focusDate) {
+  String monthKey = _getMonthKey(focusDate);
+  if (_monthlyOvertimeCache.containsKey(monthKey)) {
+    return _monthlyOvertimeCache[monthKey]!;
+  }
+
+  DateTimeRange range = _getCurrentPayCycle(focusDate);
+  DateTime rangeStart = range.start.subtract(const Duration(seconds: 1));
+  DateTime rangeEnd = range.end.add(const Duration(days: 1));
+  
+  double pool15 = 0, pool20 = 0, pool30 = 0, totalHours = 0;
+
+  _records.forEach((key, record) {
+    DateTime date = DateTime.parse(key);
+    if (date.isAfter(rangeStart) && date.isBefore(rangeEnd) && record.type == RecordType.overtime) {
+      totalHours += record.hours;
+      if (record.multiplier == 1.5) pool15 += record.hours;
+      else if (record.multiplier == 2.0) pool20 += record.hours;
+      else if (record.multiplier == 3.0) pool30 += record.hours;
+    }
+  });
+
+  final result = {'total': totalHours, '1.5x': pool15, '2.0x': pool20, '3.0x': pool30};
+  _monthlyOvertimeCache[monthKey] = result;
+  if (_monthlyOvertimeCache.length > 24) _monthlyOvertimeCache.remove(_monthlyOvertimeCache.keys.first);
+  return result;
+}
+
+// 🆕 计算一整年的总加班时长（用于年度图表）
+List<FlSpot> _calculateYearlyOvertime(int year) {
+  String key = 'ot_$year';
+  if (_yearlyOvertimeCache.containsKey(key)) return _yearlyOvertimeCache[key]!;
+
+  List<FlSpot> spots = [];
+  int maxMonth = (year == DateTime.now().year) ? DateTime.now().month : 12;
+
+  for (int m = 1; m <= maxMonth; m++) {
+    DateTime d = DateTime(year, m, 15);
+    double total = _calculateOvertimeHours(d)['total'] ?? 0;
+    spots.add(FlSpot(m.toDouble(), total));
+  }
+
+  _yearlyOvertimeCache[key] = spots;
+  return spots;
+}
+  
+  // 为日历主页提供当前焦点的统计 (调用通用方法)
+  Map<String, double> _calculateStats() {
+      return _calculateStatsForDate(_focusedDay);
+  }
+
+  // 🆕 计算一整年的统计数据（用于图表）
+  List<FlSpot> _calculateYearlyStats(int year) {
+  String key = 'income_$year';
+  if (_yearlyIncomeCache.containsKey(key)) return _yearlyIncomeCache[key]!;
+
+  List<FlSpot> spots = [];
+  int maxMonth = (year == DateTime.now().year) ? DateTime.now().month : 12;
+
+  for (int m = 1; m <= maxMonth; m++) {
+    DateTime d = DateTime(year, m, 15);
+    double total = _calculateStatsForDate(d)['total'] ?? 0;
+    spots.add(FlSpot(m.toDouble(), total));
+  }
+
+  _yearlyIncomeCache[key] = spots;
+  return spots;
+}
+
+  Future<void> _loadData() async {
+    final prefs = await SharedPreferences.getInstance();
+    try {
+      String? recStr = prefs.getString('records_v6');
+      if (recStr != null) {
+        Map<String, dynamic> map = json.decode(recStr);
+        _records = map.map((k, v) => MapEntry(k, DailyRecord.fromJson(v)));
+      }
+      String? globalStr = prefs.getString('global_config_v6');
+      if (globalStr != null) _globalConfig = SalaryConfig.fromJson(json.decode(globalStr));
+
+      String? monthsStr = prefs.getString('monthly_configs_v6');
+      if (monthsStr != null) {
+        Map<String, dynamic> map = json.decode(monthsStr);
+        _monthlyConfigs = map.map((k, v) => MapEntry(k, SalaryConfig.fromJson(v)));
+      }
+
+      String? hidden = prefs.getString('salary_hidden');
+      if (hidden != null) {
+        _isSalaryHidden = hidden == 'true';
+      }
+    } catch (e) {
+      debugPrint("Error: $e");
+    } finally {
+      setState(() => _isLoading = false);
+    }
+  }
+
+  Future<void> _saveData() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('records_v6', json.encode(_records));
+    await prefs.setString('global_config_v6', json.encode(_globalConfig));
+    await prefs.setString('monthly_configs_v6', json.encode(_monthlyConfigs));
+    await prefs.setString('salary_hidden', _isSalaryHidden.toString());
+  }
+
+  void _showAddSheet() {
+    String key = _getDateKey(_selectedDay!);
+    RecordType currentType = RecordType.overtime;
+    double multiplier = (_selectedDay!.weekday >= 6) ? 2.0 : 1.5;
+    LeaveType leaveType = LeaveType.compensatory;
+    double hours = 0.0;
+    double manualDed = 0.0;
+    String note = "";
+    if (_records.containsKey(key)) {
+      var r = _records[key]!;
+      currentType = r.type;
+      hours = r.hours;
+      multiplier = r.multiplier;
+      leaveType = r.leaveType;
+      manualDed = r.manualDeduction;
+      note = r.note;
+    }
+
+    FixedExtentScrollController scrollController = FixedExtentScrollController(initialItem: (hours / 0.5).round());
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(24))),
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setSheetState) {
+            final List<double> quickTimes = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0, 8.0, 9.0, 10.0, 12.0];
+            return Padding(
+              padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
+              child: Container(
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Row(
+                      children: [
+                        Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text("${_selectedDay!.month}月${_selectedDay!.day}日", style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
+                            Text(_records.containsKey(key) ? "编辑记录" : "新建记录", style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                          ],
+                        ),
+                        const Spacer(),
+                        if (_records.containsKey(key))
+                          IconButton(
+                            onPressed: () {
+                              setState(() => _records.remove(key));
+                              _saveData().then((_) => _clearAllCaches());
+                              Navigator.pop(context);
+                            }, 
+                            icon: const Icon(Icons.delete_outline, color: Colors.red, size: 28),
+                          )
+                      ],
+                    ),
+                    const SizedBox(height: 20),
+                    Container(
+                      padding: const EdgeInsets.all(4),
+                      decoration: BoxDecoration(color: Colors.grey.shade100, borderRadius: BorderRadius.circular(16)),
+                      child: Row(
+                        children: [
+                          _buildTabBtn("加班", currentType == RecordType.overtime, () => setSheetState(() => currentType = RecordType.overtime)),
+                          _buildTabBtn("请假/调休", currentType == RecordType.leave, () => setSheetState(() => currentType = RecordType.leave)),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 20),
+                    if (currentType == RecordType.overtime)
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceAround,
+                        children: [
+                          _buildChip("1.5倍", multiplier == 1.5, () => setSheetState(() => multiplier = 1.5)),
+                          _buildChip("2.0倍", multiplier == 2.0, () => setSheetState(() => multiplier = 2.0)),
+                          _buildChip("3.0倍", multiplier == 3.0, () => setSheetState(() => multiplier = 3.0)),
+                        ],
+                      )
+                    else
+                      Wrap(spacing: 12, children: [
+                          _buildChip("调休", leaveType == LeaveType.compensatory, () => setSheetState(() => leaveType = LeaveType.compensatory)),
+                          _buildChip("事假", leaveType == LeaveType.unpaid, () => setSheetState(() => leaveType = LeaveType.unpaid)),
+                          _buildChip("带薪", leaveType == LeaveType.paid, () => setSheetState(() => leaveType = LeaveType.paid)),
+                      ]),
+                    
+                    const SizedBox(height: 25),
+                    SizedBox(
+                      height: 45,
+                      child: ListView.separated(
+                        scrollDirection: Axis.horizontal,
+                        itemCount: quickTimes.length,
+                        separatorBuilder: (c, i) => const SizedBox(width: 10),
+                        itemBuilder: (context, index) {
+                          double t = quickTimes[index];
+                          bool isSel = hours == t;
+                          return GestureDetector(
+                            onTap: () {
+                              setSheetState(() {
+                                hours = t;
+                                scrollController.jumpToItem((t / 0.5).round());
+                              });
+                            },
+                            child: Container(
+                              alignment: Alignment.center,
+                              padding: const EdgeInsets.symmetric(horizontal: 20),
+                              decoration: BoxDecoration(
+                                color: isSel ? Colors.teal : Colors.white,
+                                border: Border.all(color: isSel ? Colors.teal : Colors.grey.shade300),
+                                borderRadius: BorderRadius.circular(24),
+                              ),
+                              child: Text("$t", style: TextStyle(color: isSel ? Colors.white : Colors.black87, fontWeight: FontWeight.bold, fontSize: 16)),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                    const SizedBox(height: 20),
+                    SizedBox(
+                        height: 150,
+                        child: CupertinoPicker(
+                          scrollController: scrollController, // 原来的 controller 继续用
+                          itemExtent: 50,
+                          diameterRatio: 1.2,
+                          magnification: 1.3,
+                          useMagnifier: true,
+                          backgroundColor: Colors.transparent,
+                          onSelectedItemChanged: (index) {
+                            setSheetState(() {
+                              hours = index * 0.5;
+                            });
+                          },
+                          children: List.generate(49, (index) {
+                            final double val = index * 0.5;
+                            final bool isSelected = val == hours;
+
+                            return Center(
+                              child: Text(
+                                val == 0 ? "0" : val.toStringAsFixed(1),
+                                style: TextStyle(
+                                  fontSize: isSelected ? 36 : 24,
+                                  fontWeight: isSelected ? FontWeight.bold : FontWeight.w500,
+                                  color: isSelected ? Colors.teal.shade700 : Colors.grey.shade600,
+                                  height: 1,
+                                ),
+                              ),
+                            );
+                          }),
+                        ),
+                      ),
+
+                    if (currentType == RecordType.leave && leaveType == LeaveType.unpaid)
+                       TextFormField(
+                         initialValue: manualDed > 0 ? manualDed.toString() : '',
+                         decoration: const InputDecoration(labelText: "扣款金额 (可选)", prefixText: "¥ "),
+                         keyboardType: TextInputType.number,
+                         onChanged: (v) => manualDed = double.tryParse(v) ?? 0,
+                       ),
+                    
+                    const SizedBox(height: 10),
+                    TextFormField(
+                      initialValue: note,
+                      decoration: const InputDecoration(labelText: "备注", prefixIcon: Icon(Icons.edit_note), border: UnderlineInputBorder()),
+                      onChanged: (v) => note = v,
+                    ),
+
+                    const SizedBox(height: 20),
+                    SizedBox(
+                      width: double.infinity, height: 54,
+                      child: ElevatedButton(
+                        onPressed: () {
+                          if (hours > 0) {
+                            setState(() {
+                              _records[key] = DailyRecord(
+                                type: currentType, hours: hours, multiplier: multiplier,
+                                leaveType: leaveType, manualDeduction: manualDed, note: note,
+                              );
+                            });
+                            _saveData().then((_) => _clearAllCaches());
+                            Navigator.pop(context);
+                          }
+                        },
+                        style: ElevatedButton.styleFrom(backgroundColor: Colors.teal, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16))),
+                        child: const Text("保存记录", style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                      ),
+                    )
+                  ],
+                ),
+              ),
+            );
+          }
+        );
+      }
+    );
+  }
+
+  Widget _buildTabBtn(String label, bool active, VoidCallback onTap) {
+    return Expanded(
+      child: GestureDetector(
+        onTap: onTap,
+        child: Container(
+          alignment: Alignment.center,
+          padding: const EdgeInsets.symmetric(vertical: 12),
+          decoration: BoxDecoration(
+            color: active ? Colors.white : Colors.transparent,
+            borderRadius: BorderRadius.circular(14),
+            boxShadow: active ? [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 4, offset: const Offset(0, 2))] : [],
+          ),
+          child: Text(label, style: TextStyle(fontWeight: FontWeight.bold, color: active ? Colors.black : Colors.grey)),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildChip(String label, bool active, VoidCallback onTap) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        decoration: BoxDecoration(
+          color: active ? Colors.teal.shade50 : Colors.grey.shade50,
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: active ? Colors.teal : Colors.grey.shade300)
+        ),
+        child: Text(label, style: TextStyle(color: active ? Colors.teal.shade800 : Colors.black87, fontWeight: active ? FontWeight.bold : FontWeight.normal)),
+      ),
+    );
+  }
+
+  void _showSettingsDialog() {
+    String currentMonthKey = _getMonthKey(_focusedDay);
+    SalaryConfig editingConfig = _getConfigForMonth(_focusedDay).copy();
+    
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setSheetState) {
+            return Padding(
+              padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
+              child: Container(
+                constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.9),
+                padding: const EdgeInsets.fromLTRB(24, 24, 24, 0),
+                child: Column(
+                  children: [
+                    Text("薪资配置 (${_focusedDay.month}月)", style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                    const Text("本月配置独立，修改不影响其他月份", style: TextStyle(fontSize: 10, color: Colors.grey)),
+                    const SizedBox(height: 20),
+                    Expanded(
+                      child: ListView(
+                        children: [
+                          DropdownButtonFormField<WorkMode>(
+                            value: editingConfig.mode,
+                            // 调整 contentPadding 让文本更靠上，避免遮挡 
+                            decoration: const InputDecoration(
+                              labelText: "工作模式",
+                              contentPadding: EdgeInsets.fromLTRB(12, 12, 12, 12), // 调整上下 padding
+                            ),
+                            items: const [
+                              DropdownMenuItem(value: WorkMode.standard, child: Text("正式工 (月薪)")),
+                              DropdownMenuItem(value: WorkMode.hourly, child: Text("小时工 (时薪)")),
+                            ],
+                            onChanged: (v) => setSheetState(() => editingConfig.mode = v!),
+                          ),
+                          const SizedBox(height: 15),
+
+                          TextFormField(
+                            initialValue: editingConfig.baseSalary.toString(),
+                            decoration: InputDecoration(labelText: editingConfig.mode == WorkMode.standard ? "月薪 (底薪)" : "基础时薪", prefixText: "¥ "),
+                            keyboardType: TextInputType.number,
+                            onChanged: (v) => editingConfig.baseSalary = double.tryParse(v) ?? 0,
+                          ),
+                          
+                          if (editingConfig.mode == WorkMode.standard) ...[
+                            const SizedBox(height: 15),
+                            TextFormField(
+                              initialValue: editingConfig.workDays.toString(),
+                              decoration: const InputDecoration(labelText: "计薪天数 (默认21.75)"),
+                              keyboardType: TextInputType.number,
+                              onChanged: (v) => editingConfig.workDays = double.tryParse(v) ?? 21.75,
+                            ),
+                            
+                            const Divider(height: 40),
+                            _buildListHeader("额外收入 (绩效/补贴)", () => setSheetState(() => editingConfig.additions.add(MoneyItem("新项目", 0)))),
+                            ...editingConfig.additions.asMap().entries.map((e) => _buildMoneyItemRow(e.value, (item) => setSheetState(() => editingConfig.additions.removeAt(e.key)))),
+
+                            const SizedBox(height: 10),
+                            _buildListHeader("固定扣款 (社保/公积金)", () => setSheetState(() => editingConfig.deductions.add(MoneyItem("新扣款", 0)))),
+                            ...editingConfig.deductions.asMap().entries.map((e) => _buildMoneyItemRow(e.value, (item) => setSheetState(() => editingConfig.deductions.removeAt(e.key)))),
+                          ],
+
+                          const Divider(height: 40),
+                          const Text("周期设置", style: TextStyle(fontWeight: FontWeight.bold)),
+                          Slider(
+                            value: editingConfig.cycleStartDay.toDouble(),
+                            min: 1, max: 28, divisions: 27,
+                            label: "${editingConfig.cycleStartDay}号",
+                            activeColor: Colors.teal,
+                            onChanged: (v) => setSheetState(() => editingConfig.cycleStartDay = v.toInt()),
+                          ),
+                          Text("每月 ${editingConfig.cycleStartDay} 号开始"),
+                          const SizedBox(height: 60),
+                        ],
+                      ),
+                    ),
+                    ElevatedButton(
+                      onPressed: () {
+                        setState(() {
+                          _monthlyConfigs[currentMonthKey] = editingConfig;
+                        });
+                        _saveData().then((_) => _clearAllCaches());
+                        Navigator.pop(context);
+                      },
+                      style: ElevatedButton.styleFrom(backgroundColor: Colors.teal, minimumSize: const Size.fromHeight(50)),
+                      child: const Text("保存本月配置", style: TextStyle(color: Colors.white, fontSize: 16)),
+                    ),
+                    const SizedBox(height: 20),
+                  ],
+                ),
+              ),
+            );
+          }
+        );
+      }
+    );
+  }
+  // 4. 新增一个统一清理方法
+  void _clearAllCaches() {
+    _monthlyStatsCache.clear();
+    _monthlyOvertimeCache.clear();
+    _yearlyIncomeCache.clear();
+    _yearlyOvertimeCache.clear();
+  }
+
+  void _showStatsDialog() {
+  final currentStats = _calculateStats(); 
+  final currentOvertime = _calculateOvertimeHours(_focusedDay); 
+  final overtimeDays = _calculateOvertimeDays(_focusedDay); // 🆕 获取本月加班天数
+  
+  showDialog(
+    context: context,
+    builder: (context) => StatsDialog(
+      currentMonthStats: currentStats,
+      currentOvertime: currentOvertime,
+      overtimeDays: overtimeDays, // 🆕 传递加班天数
+      yearlyStatsCalculator: _calculateYearlyStats, 
+      yearlyOvertimeCalculator: _calculateYearlyOvertime, 
+      focusedDate: _focusedDay,
+    ),
+  );
+}
+
+  Widget _buildListHeader(String title, VoidCallback onAdd) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
+        TextButton.icon(onPressed: onAdd, icon: const Icon(Icons.add_circle_outline, size: 16), label: const Text("添加"), style: TextButton.styleFrom(visualDensity: VisualDensity.compact))
+      ],
+    );
+  }
+
+  Widget _buildMoneyItemRow(MoneyItem item, Function(MoneyItem) onDelete) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(
+        children: [
+          Expanded(flex: 3, child: TextFormField(initialValue: item.name, decoration: const InputDecoration(contentPadding: EdgeInsets.symmetric(horizontal: 10)), onChanged: (v) => item.name = v)),
+          const SizedBox(width: 8),
+          Expanded(flex: 3, child: TextFormField(initialValue: item.amount == 0 ? '' : item.amount.toString(), decoration: const InputDecoration(prefixText: "¥", contentPadding: EdgeInsets.symmetric(horizontal: 10)), keyboardType: TextInputType.number, onChanged: (v) => item.amount = double.tryParse(v) ?? 0)),
+          IconButton(onPressed: () => onDelete(item), icon: const Icon(Icons.remove_circle, color: Colors.red, size: 20), constraints: const BoxConstraints(), padding: const EdgeInsets.only(left: 8))
+        ],
+      ),
+    );
+  }
+
+@override
+  Widget build(BuildContext context) {
+    if (_isLoading) return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    final stats = _calculateStats();
+    DateTimeRange cycle = _getCurrentPayCycle(_focusedDay);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('加薪日历', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+        backgroundColor: Colors.teal,
+        actions: [
+          IconButton(
+              icon: const Icon(Icons.bar_chart, color: Colors.white),
+              onPressed: _showStatsDialog,
+              tooltip: "统计",
+          ),
+          IconButton(icon: const Icon(Icons.settings, color: Colors.white), onPressed: _showSettingsDialog)
+        ],
+      ),
+      body: Column(
+        children: [
+          Container(
+            padding: const EdgeInsets.fromLTRB(24, 10, 24, 30),
+            decoration: const BoxDecoration(
+              gradient: LinearGradient(colors: [Colors.teal, Color(0xFF00695C)]),
+              borderRadius: BorderRadius.vertical(bottom: Radius.circular(30)),
+            ),
+            child: Column(
+              children: [
+                Text("${cycle.start.month}.${cycle.start.day} - ${cycle.end.month}.${cycle.end.day}", style: const TextStyle(color: Colors.white70)),
+                const SizedBox(height: 20),
+                Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        _isSalaryHidden ? "¥ ••••" : "¥ ${stats['total']!.toStringAsFixed(2)}",
+                        style: const TextStyle(color: Colors.white, fontSize: 36, fontWeight: FontWeight.bold),
+                      ),
+                      const SizedBox(width: 8),
+                      GestureDetector(
+                        onTap: () => setState(() {
+                          _isSalaryHidden = !_isSalaryHidden;
+                          _saveData(); 
+                        }),
+                        child: Icon(_isSalaryHidden ? Icons.visibility_off : Icons.visibility, color: Colors.white70, size: 28),
+                      ),
+                    ],
+                  ),
+                const SizedBox(height: 20),
+                // 🔥 核心修改：使用 Visibility 保持 Row 的空间，避免 UI 跳动
+                Visibility(
+                  visible: !_isSalaryHidden, // 仅在未隐藏时可见
+                  maintainSize: true,        // 即使不可见也保持空间大小 (解决收缩问题)
+                  maintainAnimation: true,
+                  maintainState: true,
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceAround,
+                    children: [
+                      _buildHeaderStat("底薪+绩效", (stats['base']! + stats['adds']!).toStringAsFixed(0)),
+                      _buildHeaderStat("加班费", "+${stats['overtime']!.toStringAsFixed(0)}"),
+                      _buildHeaderStat("扣除", "-${stats['deduct']!.toStringAsFixed(0)}"),
+                    ],
+                  ),
+                )
+              ],
+            ),
+          ),
+          Expanded(
+            child: CustomScrollView(
+              slivers: [
+                SliverPadding(
+                  padding: const EdgeInsets.all(16),
+                  sliver: SliverList(
+                    delegate: SliverChildListDelegate([
+                      Card(
+                        elevation: 2,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+                        child: TableCalendar(
+                          locale: 'zh_CN',
+                          firstDay: DateTime.utc(2020, 1, 1),
+                          lastDay: DateTime.utc(2035, 12, 31),
+                          focusedDay: _focusedDay,
+                          currentDay: DateTime.now(),
+                          availableCalendarFormats: const {CalendarFormat.month: ''},
+                          headerStyle: const HeaderStyle(
+                            formatButtonVisible: false,
+                            titleCentered: true,
+                            titleTextStyle: TextStyle(color: Colors.black87, fontSize: 18, fontWeight: FontWeight.bold),
+                          ),
+                          selectedDayPredicate: (day) => isSameDay(_selectedDay, day),
+                          onDaySelected: (s, f) => setState(() { _selectedDay = s; _focusedDay = f; }),
+                          onPageChanged: (f) => setState(() => _focusedDay = f),
+                          rowHeight: 65,
+                          calendarStyle: const CalendarStyle(outsideDaysVisible: false),
+                          // 关键一行！让日历把滑动事件交给父层
+                          calendarBuilders: CalendarBuilders(
+                            defaultBuilder: (c, day, f) => _buildCell(day, isSelected: false, isToday: false),
+                            selectedBuilder: (c, day, f) => _buildCell(day, isSelected: true, isToday: false),
+                            todayBuilder: (c, day, f) => _buildCell(day, isSelected: false, isToday: true),
+                            markerBuilder: (context, date, events) { String key = _getDateKey(date);
+                        if (_records.containsKey(key)) {
+                          final rec = _records[key]!;
+                          bool isOT = rec.type == RecordType.overtime;
+                          String text = isOT ? "+${rec.hours}" : "-${rec.hours}";
+                          Color color = isOT ? (rec.multiplier >= 2 ? Colors.red : Colors.blue) : Colors.green;
+                          
+                          return Positioned(
+                            bottom: 2, 
+                            child: Text(text, style: TextStyle(color: color, fontSize: 10, fontWeight: FontWeight.bold)),
+                          );
+                        }
+                        return null; },
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 20),
+                      if (_selectedDay != null) _buildDayDetail(),
+                      const SizedBox(height: 80),
+                    ]),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: _showAddSheet,
+        backgroundColor: Colors.teal,
+        child: const Icon(Icons.add, color: Colors.white),
+      ),
+    );
+  }
+  final Map<String, Widget> _cellCache = {};
+  // 🔥 核心更新：使用真实的 Lunar 库渲染农历
+  Widget _buildCell(DateTime day, {required bool isSelected, required bool isToday}) {
+    final String key = "${day.year}-${day.month}-${day.day}-$isSelected-$isToday";
+    
+    return _cellCache.putIfAbsent(key, () {
+    final Lunar lunar = Lunar.fromDate(day); // 只创建一次！
+    String lunarText = lunar.getDayInChinese();
+    Color lunarColor = Colors.grey.shade500;
+
+    List<String> festivals = lunar.getFestivals();
+    if (festivals.isNotEmpty) {
+      lunarText = festivals[0];
+      lunarColor = Colors.teal;
+    } else {
+      String jieQi = lunar.getJieQi();
+      if (jieQi.isNotEmpty) {
+        lunarText = jieQi;
+        lunarColor = Colors.teal.shade700;
+      } else if (lunar.getDay() == 1) {
+        lunarText = "${lunar.getMonthInChinese()}月";
+        lunarColor = Colors.teal;
+      }
+    }
+
+    return Column(
+      mainAxisAlignment: MainAxisAlignment.start,
+      children: [
+        const SizedBox(height: 8),
+        Container(
+          width: 32,
+          height: 32,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: isSelected ? Colors.teal : (isToday ? Colors.teal.withOpacity(0.3) : null),
+            shape: BoxShape.circle,
+          ),
+          child: Text(
+            '${day.day}',
+            style: TextStyle(
+              color: isSelected ? Colors.white : (isToday ? Colors.teal : Colors.black87),
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ),
+        Text(
+          lunarText,
+          style: TextStyle(fontSize: 9, color: isSelected ? Colors.teal.shade100 : lunarColor),
+        ),
+      ],
+    );
+  });
+}
+
+  Widget _buildDayDetail() {
+    String key = _getDateKey(_selectedDay!);
+    DailyRecord? record = _records[key];
+    SalaryConfig cfg = _getConfigForMonth(_focusedDay);
+    double rate = _getHourlyRate(cfg);
+    return Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20), border: Border.all(color: Colors.grey.shade200)),
+      child: Row(
+        children: [
+          Icon(
+            record == null ? Icons.calendar_today : (record.type == RecordType.overtime ? Icons.access_time_filled : Icons.beach_access),
+            color: record == null ? Colors.grey : Colors.teal,
+            size: 32,
+          ),
+          const SizedBox(width: 16),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (record == null)
+                  const Text("无记录", style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold))
+                else ...[
+                  Text(
+                    record.type == RecordType.overtime 
+                      ? "加班 ${record.hours}h (${record.multiplier}倍)" 
+                      : "请假 ${record.hours}h (${_getLeaveText(record.leaveType)})",
+                    style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)
+                  ),
+                  if (record.note.isNotEmpty)
+                    Text(record.note, style: const TextStyle(color: Colors.grey, fontSize: 12), overflow: TextOverflow.ellipsis),
+                ]
+              ],
+            ),
+          ),
+          if (record != null && record.type == RecordType.overtime)
+            Text("+¥${(record.hours * rate * record.multiplier).toStringAsFixed(1)}", style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.orange)),
+        ],
+      ),
+    );
+  }
+
+  String _getLeaveText(LeaveType type) {
+    switch (type) {
+      case LeaveType.compensatory: return "调休";
+      case LeaveType.paid: return "带薪";
+      case LeaveType.unpaid: return "事假";
+      default: return "";
+    }
+  }
+
+  Widget _buildHeaderStat(String label, String val) {
+    return Column(children: [
+      Text(val, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
+      Text(label, style: const TextStyle(color: Colors.white70, fontSize: 10)),
+    ]);
+  }
+  // 🆕 统计特定月份的加班天数
+int _calculateOvertimeDays(DateTime focusDate) {
+    DateTimeRange range = _getCurrentPayCycle(focusDate);
+    DateTime rangeStart = range.start.subtract(const Duration(seconds: 1));
+    DateTime rangeEnd = range.end.add(const Duration(days: 1));
+    
+    int overtimeDays = 0;
+
+    _records.forEach((key, record) {
+        DateTime date = DateTime.parse(key);
+        if (date.isAfter(rangeStart) && date.isBefore(rangeEnd)) {
+            // 只要这一天有加班记录，就算一天
+            if (record.type == RecordType.overtime && record.hours > 0) {
+                overtimeDays++;
+            }
+        }
+    });
+    
+    return overtimeDays;
+}
+}
+// 从这里开始替换文件末尾的整个 StatsDialog 类定义
+
+class StatsDialog extends StatefulWidget {
+  final Map<String, double> currentMonthStats;
+  final Map<String, double> currentOvertime; 
+  final int overtimeDays; // 🆕 新增：加班天数
+  final List<FlSpot> Function(int year) yearlyStatsCalculator;
+  final List<FlSpot> Function(int year) yearlyOvertimeCalculator; 
+  final DateTime focusedDate;
+
+  const StatsDialog({
+    super.key,
+    required this.currentMonthStats,
+    required this.currentOvertime,
+    required this.overtimeDays, // 🆕
+    required this.yearlyStatsCalculator,
+    required this.yearlyOvertimeCalculator,
+    required this.focusedDate,
+  });
+
+  @override
+  State<StatsDialog> createState() => _StatsDialogState();
+}
+
+enum StatView { income, overtime } // 视图切换：收入 vs 加班
+
+class _StatsDialogState extends State<StatsDialog> {
+  StatView _currentView = StatView.income; 
+  late int _selectedYear;
+
+  @override
+  void initState() {
+    super.initState();
+    _selectedYear = widget.focusedDate.year;
+  }
+  
+  // 用于渲染月度统计的简要卡片
+  Widget _buildStatItem(String label, String value, Color color) {
+    return Column(
+      children: [
+        Text(value, style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: color)),
+        const SizedBox(height: 4),
+        Text(label, style: const TextStyle(color: Colors.grey, fontSize: 12)),
+      ],
+    );
+  }
+
+  // 用于年度选择的按钮
+  Widget _buildYearSelector(String title) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        IconButton(
+          icon: const Icon(Icons.chevron_left),
+          onPressed: () => setState(() => _selectedYear--),
+        ),
+        Text(
+          "$_selectedYear $title",
+          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+        ),
+        IconButton(
+          icon: const Icon(Icons.chevron_right),
+          onPressed: _selectedYear < DateTime.now().year ? () => setState(() => _selectedYear++) : null, 
+        ),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final currentStats = widget.currentMonthStats;
+    final currentOvertime = widget.currentOvertime;
+    final cycleMonth = widget.focusedDate.month;
+
+    final isIncomeView = _currentView == StatView.income;
+    final yearlySpots = isIncomeView
+        ? widget.yearlyStatsCalculator(_selectedYear)
+        : widget.yearlyOvertimeCalculator(_selectedYear);
+
+    double maxY = yearlySpots.isNotEmpty
+        ? yearlySpots.map((s) => s.y).reduce((a, b) => a > b ? a : b) * 1.1
+        : (isIncomeView ? 20000 : 100);
+
+    return Dialog.fullscreen(
+      backgroundColor: const Color(0xFFF8FAFD),
+      child: SafeArea(
+        child: Column(
+          children: [
+            // 顶部标题栏
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 10, 16, 10),
+              child: Row(
+                children: [
+                  const Text(
+                    '统计分析',
+                    style: TextStyle(fontSize: 21, fontWeight: FontWeight.bold),
+                  ),
+                  const Spacer(),
+                  IconButton(
+                    icon: const Icon(Icons.close_rounded),
+                    onPressed: () => Navigator.pop(context),
+                  ),
+                ],
+              ),
+            ),
+
+            // 收入 / 加班 切换按钮
+            Container(
+              margin: const EdgeInsets.symmetric(horizontal: 20),
+              padding: const EdgeInsets.all(4),
+              decoration: BoxDecoration(
+                color: Colors.grey.shade100,
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: Row(
+                children: [
+                  _buildTabBtn("收入分析", isIncomeView, () => setState(() => _currentView = StatView.income)),
+                  _buildTabBtn("加班统计", !isIncomeView, () => setState(() => _currentView = StatView.overtime)),
+                ],
+              ),
+            ),
+
+            const SizedBox(height: 20),
+
+            // 主体内容（可滚动）
+            Expanded(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.symmetric(horizontal: 20),
+                child: Column(
+                  children: [
+                    if (isIncomeView)
+                      _buildIncomeView(currentStats, yearlySpots, maxY, cycleMonth)
+                    else
+                      _buildOvertimeView(currentOvertime, yearlySpots, maxY, cycleMonth),
+
+                    const SizedBox(height: 30),
+                    // 关闭按钮（放在底部更舒服）
+                    SizedBox(
+                      width: double.infinity,
+                      height: 52,
+                      child: ElevatedButton(
+                        onPressed: () => Navigator.pop(context),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.teal,
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                        ),
+                        child: const Text("关闭", style: TextStyle(fontSize: 17, color: Colors.white)),
+                      ),
+                    ),
+                    const SizedBox(height: 20),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+  
+  // 收入视图
+  Widget _buildIncomeView(Map<String, double> stats, List<FlSpot> yearlySpots, double maxY, int month) {
+    return Column(
+      children: [
+        // 月度收入卡片
+        Text(
+          "$month 月周期收入",
+          style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Colors.teal),
+        ),
+        const SizedBox(height: 15),
+        Text(
+          "¥ ${stats['total']!.toStringAsFixed(2)}",
+          style: const TextStyle(fontSize: 36, fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 20),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceAround,
+          children: [
+            _buildStatItem("底薪+绩效", "¥ ${(stats['base']! + stats['adds']!).toStringAsFixed(0)}", Colors.green),
+            _buildStatItem("加班费", "¥ ${stats['overtime']!.toStringAsFixed(0)}", Colors.blue),
+            _buildStatItem("总扣除", "¥ ${stats['deduct']!.toStringAsFixed(0)}", Colors.red),
+          ],
+        ),
+        
+        const SizedBox(height: 30),
+        const Divider(),
+        const SizedBox(height: 20),
+
+        // 年度收入图表
+        _buildLineChart(yearlySpots, maxY, "年收入趋势", (value) => "¥${(value / 1000).toStringAsFixed(0)}k", Colors.teal),
+      ],
+    );
+  }
+  
+  // 加班视图
+  Widget _buildOvertimeView(Map<String, double> overtime, List<FlSpot> yearlySpots, double maxY, int month) {
+    return Column(
+      children: [
+        // 月度加班卡片
+        Text(
+          "$month 月周期加班统计",
+          style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Colors.teal),
+        ),
+        const SizedBox(height: 25),
+        
+        // 🆕 加班天数统计
+        _buildStatItem("加班天数", "${widget.overtimeDays} 天", Colors.blueGrey),
+        const SizedBox(height: 20),
+
+        // 扇形图：倍率分布
+        _buildOvertimePieChart(overtime),
+
+        const SizedBox(height: 30),
+        const Divider(),
+        const SizedBox(height: 20),
+
+        // 年度加班图表
+        _buildLineChart(yearlySpots, maxY, "年加班趋势", (value) => "${value.toStringAsFixed(0)}h", Colors.deepOrange),
+      ],
+    );
+}
+
+// 🆕 新增：加班扇形图渲染方法
+Widget _buildOvertimePieChart(Map<String, double> overtime) {
+    final totalHours = overtime['total'] ?? 0;
+    
+    // 如果没有数据，显示提示
+    if (totalHours == 0) {
+        return const SizedBox(
+            height: 150,
+            child: Center(
+                child: Text("本月无加班数据", style: TextStyle(color: Colors.grey)),
+            ),
+        );
+    }
+    
+    // 创建 PieChartSectionData 列表
+    List<PieChartSectionData> sections = [];
+    final colors = {
+        '1.5x': const Color.fromARGB(255, 33, 171, 192),
+        '2.0x': const Color.fromARGB(255, 20, 199, 88),
+        '3.0x': const Color.fromARGB(255, 251, 56, 125),
+    };
+    
+    overtime.forEach((key, hours) {
+        if (key != 'total' && hours > 0) {
+            
+            // 🆕 修复点 1: 移除扇区上的百分比标签 (title) 以避免重叠
+            sections.add(
+                PieChartSectionData(
+                    color: colors[key],
+                    value: hours,
+                    title: '', // 移除标题
+                    radius: 60,
+                    // titleStyle: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white), // 标题被移除，这行可以删掉
+                ),
+            );
+        }
+    });
+
+    return SizedBox(
+      // 增加高度以容纳图例
+      height: 250, 
+      child: Column(
+        children: [
+          // 扇形图区域
+          Expanded(
+            child: PieChart(
+              PieChartData(
+                sectionsSpace: 2,
+                centerSpaceRadius: 40,
+                startDegreeOffset: -90,
+                sections: sections,
+              ),
+            ),
+          ),
+          
+          // 🆕 修复点 2: 增加图例和图表之间的间距
+          const SizedBox(height: 20), 
+          
+          // 图例区域
+          Wrap(
+            spacing: 16, // 增加图例项之间的水平间距
+            runSpacing: 8, // 增加图例项之间的垂直间距
+            alignment: WrapAlignment.center,
+            children: overtime.entries.where((e) => e.key != 'total' && e.value > 0).map((entry) {
+              final hours = entry.value;
+              final percentage = (hours / totalHours) * 100;
+
+              return Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(width: 10, height: 10, color: colors[entry.key]),
+                  const SizedBox(width: 6),
+                  // 🆕 修复点 3: 将百分比和小时数显示在图例中
+                  Text(
+                    '${entry.key}: ${hours.toStringAsFixed(1)}h (${percentage.toStringAsFixed(1)}%)', 
+                    style: const TextStyle(fontSize: 12)
+                  ),
+                ],
+              );
+            }).toList(),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            "总加班：${totalHours.toStringAsFixed(1)} 小时",
+            style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+          ),
+        ],
+      ),
+    );
+}
+  // 统一的图表渲染方法
+  Widget _buildLineChart(List<FlSpot> spots, double maxY, String title, String Function(double) formatY, MaterialColor color) {
+  return Column(
+    children: [
+      _buildYearSelector(title),
+      const SizedBox(height: 15),
+      SizedBox(
+        height: 250,
+        child: LineChart(
+          LineChartData(
+            minX: 1,
+            maxX: 12,
+            minY: 0,
+            maxY: maxY,
+            gridData: FlGridData(
+              show: true,
+              drawVerticalLine: true,
+              getDrawingHorizontalLine: (value) => const FlLine(color: Colors.grey, strokeWidth: 0.2),
+              getDrawingVerticalLine: (value) => const FlLine(color: Colors.grey, strokeWidth: 0.2),
+            ),
+            titlesData: FlTitlesData(
+              show: true,
+              rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+              topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+              bottomTitles: AxisTitles(
+                sideTitles: SideTitles(
+                  showTitles: true,
+                  reservedSize: 30,
+                  interval: 1,
+                  getTitlesWidget: (value, meta) => Padding(
+                    padding: const EdgeInsets.only(top: 8.0),
+                    child: Text("${value.toInt()}月", style: const TextStyle(fontSize: 10)),
+                  ),
+                ),
+              ),
+              leftTitles: AxisTitles(
+                sideTitles: SideTitles(
+                  showTitles: true,
+                  reservedSize: 40,
+                  getTitlesWidget: (value, meta) {
+                    if (value == 0) return const Text('');
+                    return Text(formatY(value), style: const TextStyle(fontSize: 10));
+                  },
+                ),
+              ),
+            ),
+            borderData: FlBorderData(show: true, border: Border.all(color: const Color(0xff37434d))),
+
+            // 最新版 fl_chart 正确写法（重点在这里！）
+            lineTouchData: LineTouchData(
+              enabled: true,
+              touchTooltipData: LineTouchTooltipData(           // ← 直接是 LineTooltipData
+                getTooltipColor: (LineBarSpot touchedSpot) => color.shade700.withOpacity(0.95),
+                tooltipPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                fitInsideHorizontally: true,
+                fitInsideVertically: true,
+                getTooltipItems: (touchedSpots) {
+                  return touchedSpots.map((spot) {
+                    final value = spot.y;
+                    final text = value >= 10000
+                        ? '${(value / 10000).toStringAsFixed(1)}万'
+                        : NumberFormat('#,###').format(value.toInt());
+                    return LineTooltipItem(
+                      text,
+                      const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16),
+                    );
+                  }).toList();
+                },
+              ),
+            ),
+
+            lineBarsData: [
+              LineChartBarData(
+                spots: spots,
+                isCurved: true,
+                color: color,
+                barWidth: 3,
+                isStrokeCapRound: true,
+                dotData: FlDotData(
+                  show: true,
+                  getDotPainter: (spot, percent, bar, index) => FlDotCirclePainter(
+                    radius: 5,
+                    color: color.shade700,
+                    strokeWidth: 3,
+                    strokeColor: Colors.white,
+                  ),
+                ),
+                belowBarData: BarAreaData(show: true, color: color.withOpacity(0.25)),
+              ),
+            ],
+          ),
+        ),
+      ),
+    ],
+  );
+}
+
+  // 辅助函数 (用于主切换按钮)
+  Widget _buildTabBtn(String label, bool active, VoidCallback onTap) {
+    return Expanded(
+      child: GestureDetector(
+        onTap: onTap,
+        child: Container(
+          alignment: Alignment.center,
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          decoration: BoxDecoration(
+            color: active ? Colors.white : Colors.transparent,
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Text(
+            label, 
+            style: TextStyle(
+              fontWeight: FontWeight.bold, 
+              color: active ? Colors.teal.shade800 : Colors.grey.shade600
+            )
+          ),
+        ),
+      ),
+    );
+  }
+}
